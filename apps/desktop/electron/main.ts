@@ -272,6 +272,7 @@ import { serializeJsonBody, setJsonRequestHeaders } from './oauth-net-request'
 import { LEGACY_OAUTH_PARTITION, resolveOauthPartition } from './oauth-partition'
 import { createParentStartMarkerResolver, parentWatchdogEnv } from './parent-process-identity'
 import { adoptPayloadVenv, installIdForRoot, isBundledInstall, resolvePayload, type PayloadInfo } from './payload-backend'
+import { listWindowsProcesses, reapPackageRootedProcesses } from './package-process-reap'
 import { PLACEHOLDER_FEED_BASE_URL } from './app-updater'
 import { AppInstallerStrategy } from './updater/app-installer'
 import { ExternalStrategy } from './updater/external'
@@ -12457,6 +12458,44 @@ function stopAllPoolBackends() {
   return poolStopper.stopAll()
 }
 
+/**
+ * Last teardown act on Windows: kill anything still running out of our install
+ * root, so no straggler pins the package family's container silo.
+ *
+ * A pinned silo makes EVERY later activation of the family fail at the job →
+ * silo conversion with 0x80070020 — the app never launches again, and Windows
+ * shows the misleading "used by another process" file-lock message. Live cause
+ * on windows-11-arm was the payload's bundled-git gpg-agent, which daemonizes
+ * itself out of our process tree and so is unreachable by taskkill /T. See
+ * package-process-reap.ts for the full mechanism and the live evidence.
+ *
+ * Runs AFTER the graceful backend teardown and skips the pids that owned, so
+ * this is only the net for what detached. Best effort throughout: quit must
+ * never hang or fail on it.
+ */
+function reapInstallRootedStragglers(excludePids: number[]): void {
+  if (!IS_WINDOWS || !isBundledInstall(process.resourcesPath, { fileExists })) {
+    return
+  }
+
+  try {
+    reapPackageRootedProcesses({
+      installRoot: process.resourcesPath,
+      listProcesses: () => listWindowsProcesses((file, args, options) => execFileSync(file, args, {
+        ...hiddenWindowsChildOptions({ encoding: 'utf8', timeout: options.timeout }),
+        windowsHide: options.windowsHide
+      }) as unknown as string),
+      killProcess: pid => process.kill(pid, 'SIGKILL'),
+      selfPid: process.pid,
+      excludePids,
+      isWindows: true,
+      log: message => rememberLog(message)
+    })
+  } catch (err) {
+    rememberLog(`[package-reap] skipped: ${(err as Error).message}`)
+  }
+}
+
 const backendShutdown = createBackendShutdownCoordinator(async () => {
   const primary = backendConnectionState.invalidate()
 
@@ -12469,6 +12508,8 @@ const backendShutdown = createBackendShutdownCoordinator(async () => {
   }
 
   await Promise.all([waitForBackendExit(primary), pooledStops])
+
+  reapInstallRootedStragglers(Number.isInteger(primary?.pid) ? [primary.pid] : [])
 })
 
 async function exitAfterBackendShutdown(code) {
